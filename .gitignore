@@ -1,0 +1,16 @@
+# Secrets and local credentials
+secrets/
+*.secret
+*.secrets
+*.pem
+*.key
+.env
+.env.*
+!.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+
+# Databricks local / bundle state
+.databricks/
