@@ -1,37 +1,15 @@
-# Databricks notebook source
-# DBTITLE 1,Title
-# MAGIC %md
-# MAGIC # World Bank Silver Layer Pipeline
-# MAGIC
-# MAGIC Transforms World Bank API extracts landed by ADF in Bronze (NDJSON) into curated Delta tables in `dbt_global_economy.silver`. Bronze is read-only; Silver is history-preserving (business key + load date) and idempotent.
 
-# COMMAND ----------
-
-# DBTITLE 1,Step 1 header
-# MAGIC %md
-# MAGIC ## Step 1 - Configuration, logging and Unity Catalog setup
-# MAGIC
-# MAGIC * All environment-specific values are centralised in one immutable config object (widgets allow overrides per environment / job run).
-# MAGIC * A structured logger tagged with a unique `run_id` is used throughout, so every log line and audit record can be traced to a single execution.
-# MAGIC * The `silver` schema is created idempotently (`IF NOT EXISTS`) with a managed location in the Silver container, so all Silver tables are UC-managed Delta tables (governance, lineage, predictive optimisation) while physically stored in `stglobaleconomic/silver`.
-# MAGIC * Bronze is accessed read-only: this step only lists it, never writes.
-
-# COMMAND ----------
-
-# DBTITLE 1,Pipeline configuration and logger
 import logging
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
 
-# ---------------------------------------------------------------------------
-# Parameters (overridable when the notebook runs as a Lakeflow Job task)
-# ---------------------------------------------------------------------------
+
 dbutils.widgets.text("catalog", "dbt_global_economy")
 dbutils.widgets.text("silver_schema", "silver")
 dbutils.widgets.text("bronze_root", "abfss://bronze@stglobaleconomic.dfs.core.windows.net/worldbank/")
 dbutils.widgets.text("silver_location", "abfss://silver@stglobaleconomic.dfs.core.windows.net/worldbank")
-# Shared job parameters (declared in both Silver and Gold notebooks; not used by Silver)
+
 dbutils.widgets.text("gold_schema", "gold")
 dbutils.widgets.text("gold_location", "abfss://gold@stglobaleconomic.dfs.core.windows.net/worldbank")
 
@@ -96,7 +74,7 @@ logger.info(f"Config loaded: catalog={cfg.catalog}, schema={cfg.silver_schema}, 
             f"bronze_root={cfg.bronze_root}, silver_location={cfg.silver_location}")
 logger.info(f"Spark version: {spark.version}")
 
-# COMMAND ----------
+
 
 # DBTITLE 1,Create Silver schema and validate access
 # ---------------------------------------------------------------------------
@@ -144,21 +122,6 @@ if not location.rstrip("/").startswith(cfg.silver_location):
     raise PipelineError(f"Unexpected Silver schema location: {location!r}")
 logger.info(f"Step 1 validation passed: schema {cfg.schema_fqn} located at {location}")
 
-# COMMAND ----------
-
-# DBTITLE 1,Step 2 header
-# MAGIC %md
-# MAGIC ## Step 2 - Source discovery, line-level parsing and structural inspection (read-only)
-# MAGIC
-# MAGIC * **2a** Recursive file inventory; indicator, ISO3 and load date parsed from the path and validated (pattern, date, folder/file consistency, empty files, duplicate loads).
-# MAGIC * **2b** Each file is read as plain text, line by line (no `multiline`, no schema inference). Each line is cleaned of the UTF-8 BOM / CR, parsed with `try_parse_json` (malformed lines become NULL instead of failing the job) and classified as `PAGINATION_METADATA`, `OBSERVATION`, `MALFORMED`, `NON_OBJECT`, `BLANK` or `UNKNOWN`.
-# MAGIC * **2c** Structure is inferred from the data itself (`schema_of_variant_agg`) per record type, including nested fields, value types and date formats.
-# MAGIC * **2d** Expected key sets are derived from 2c; every record is checked for extra/missing keys (schema drift). Fields are extracted losslessly from VARIANT as strings - typing happens in Step 6 with explicit validation.
-# MAGIC * **2e** Validation: file coverage, per-file reconciliation against `meta.total`/`pages`, path-vs-content consistency, and an independent row count with Spark's JSON reader.
-# MAGIC
-# MAGIC Nothing is written in this step.
-
-# COMMAND ----------
 
 # DBTITLE 1,2a - Bronze file inventory
 import re
@@ -445,21 +408,6 @@ if failed:
 logger.info(f"Step 2 validation passed: {len(checks)} checks, "
             f"{sum(c[3] == 'WARN' for c in checks)} warning(s)")
 
-# COMMAND ----------
-
-# DBTITLE 1,Step 3 header
-# MAGIC %md
-# MAGIC ## Step 3 - Bronze-to-Silver raw parsing (test run, nothing written)
-# MAGIC
-# MAGIC * **Explicit schemas** for both record types, derived from the Step 2 inference. `value` is `DECIMAL(38,10)`: the observed values are DECIMAL(13..15, 1..5), so 28 integer + 10 fractional digits hold every GDP value exactly with headroom. Any value that cannot be held exactly is quarantined (`PRECISION_LOSS`), never rounded silently.
-# MAGIC * **Line-by-line parsing**: the Step 2 text read (one row per NDJSON line) is parsed with `from_json` in `PERMISSIVE` mode with a corrupt-record column. `multiline` is never used.
-# MAGIC * **Record separation**: `PAGINATION_METADATA` and `OBSERVATION` lines are parsed with their own schema; every other line type goes to `parse_errors_df`.
-# MAGIC * **Error capture**: a record is rejected (to `parse_errors_df`, with its raw line and all reasons) on `PARSE_FAILURE`, `TYPE_MISMATCH:<field>` (source value present but not convertible), `PRECISION_LOSS`, or a non-business line type. A JSON `null` in the source is **not** an error and stays NULL.
-# MAGIC * **Schema drift policy**: new keys (top-level or nested) and missing keys do not fail the record - all known fields are still typed, and the deviation is recorded in `drift_extra_keys` / `drift_missing_keys` with the full `raw_record` retained, so no information is lost. Drift counts are logged as warnings.
-# MAGIC * **Lineage**: `source_file_path`, `ingestion_date` (ADF load date from the file name), `ingestion_timestamp` (time ADF landed the file in Bronze), plus `pipeline_run_id` and `processed_timestamp` for this run.
-# MAGIC * Value standardisation (e.g. empty string to NULL for `unit` / `obs_status`) is intentionally left to the transformation step so this step reflects the source exactly.
-
-# COMMAND ----------
 
 # DBTITLE 1,3a - Explicit source schemas
 # Explicit schemas derived from the Step 2 inference (schema_of_variant_agg) - not assumed.
@@ -739,20 +687,7 @@ if failed3:
     raise PipelineError(f"Step 3 validation failed: {[c[0] for c in failed3]}")
 logger.info(f"Step 3 validation passed: {len(checks3)} checks, {sum(c[3] == 'WARN' for c in checks3)} warning(s)")
 
-# COMMAND ----------
 
-# DBTITLE 1,Step 4 header
-# MAGIC %md
-# MAGIC ## Step 4 - Separate metadata from business observations (test run, nothing written)
-# MAGIC
-# MAGIC * **`gdp_observations_df`** - clean business records for `NY.GDP.MKTP.CD` (the indicator observed in Bronze). Observations of any other indicator are **not dropped**: they go to `non_gdp_observations_df`, and the counts must add up.
-# MAGIC * **Standardisation (approved)**: empty or whitespace-only `unit` / `obs_status` become NULL. Non-empty values are kept exactly as received. No other value is changed, and missing GDP values stay NULL (never 0).
-# MAGIC * **`year`** is derived only when `observation_period` is a 4-digit year (all 66 current rows). Any other period format keeps `year = NULL`, and the original `observation_period` is always retained, so nothing is lost.
-# MAGIC * **`load_metadata_df`** - page-level World Bank metadata with lineage, plus per-file reconciliation columns for audit.
-# MAGIC * **`file_reconciliation_df`** - one row per source file comparing the API's `total` with valid observations + observation parse errors, with a reconciliation status.
-# MAGIC * `raw_record` is not carried in the clean DataFrame: Bronze is immutable and keeps the exact line, and rejected lines keep their raw text in `parse_errors_df`.
-
-# COMMAND ----------
 
 # DBTITLE 1,4a - Build metadata and GDP observation DataFrames
 GDP_INDICATOR_ID = "NY.GDP.MKTP.CD"            # observed indicator.id in Bronze: "GDP (current US$)"
@@ -922,22 +857,7 @@ if failed4:
     raise PipelineError(f"Step 4 validation failed: {[c[0] for c in failed4]}")
 logger.info(f"Step 4 validation passed: {len(checks4)} checks, {sum(c[3] == 'WARN' for c in checks4)} warning(s)")
 
-# COMMAND ----------
 
-# DBTITLE 1,Step 5 header
-# MAGIC %md
-# MAGIC ## Step 5 - Reconciliation and completeness validation (read-only, nothing written)
-# MAGIC
-# MAGIC One report row per source file. Every check is classified by severity:
-# MAGIC
-# MAGIC | Severity | Meaning | Checks |
-# MAGIC | --- | --- | --- |
-# MAGIC | **FAIL** (critical, pipeline stops) | The file cannot be trusted as a complete, correct extract | missing metadata; actual != API total; invalid / inconsistent / incomplete pagination; duplicate business keys; indicator or ISO3 not matching the file path; parse errors (malformed, type mismatch, precision loss, unknown lines); observations of another indicator in a GDP file; Bronze files excluded by the inventory (bad name, empty, duplicate load) |
-# MAGIC | **WARN** (reported, records kept unchanged) | Plausible in World Bank data but needs a business decision | gaps in the year series; NULL GDP values; negative or zero GDP; non-annual periods; future years; schema drift; >1 indicator/country name per file; source `lastupdated` after the load date |
-# MAGIC
-# MAGIC Negative or zero GDP is reported as a warning rather than a rule I've made up: how to treat it is your decision. No record is deleted, changed or filtered out in this step.
-
-# COMMAND ----------
 
 # DBTITLE 1,5a - Per-file profiling (observations, pagination, errors)
 BUSINESS_KEY = ["indicator_id", "country_iso3_code", "observation_period", "ingestion_date"]
@@ -1146,35 +1066,7 @@ if failed5:
     raise PipelineError(f"Step 5 reconciliation failed: {[c[0] for c in failed5]}")
 logger.info(f"Step 5 reconciliation passed: {len(checks5)} checks, {sum(c[3] == 'WARN' for c in checks5)} warning(s)")
 
-# COMMAND ----------
 
-# DBTITLE 1,Step 6 header
-# MAGIC %md
-# MAGIC ## Step 6 - Standardised Silver GDP DataFrame (test run, nothing written)
-# MAGIC
-# MAGIC Input: the validated `gdp_observations_df` (Steps 3-5). Output: `silver_gdp_df`, matching an explicit column contract (`SILVER_GDP_SCHEMA`), plus `silver_gdp_rejects_df` for records that cannot form a valid key.
-# MAGIC
-# MAGIC | Transformation | Rule | Why |
-# MAGIC | --- | --- | --- |
-# MAGIC | Flattening / naming | Nested `indicator{}` / `country{}` already flattened in Step 3; all columns snake_case | Clear, Gold-friendly names |
-# MAGIC | `year` | `INT`, only from 4-digit periods; `observation_period` (text) always kept | Typed year for joins/filters, no loss for non-annual periods |
-# MAGIC | `gdp_value` | `DECIMAL(38,10)`, carried unchanged | Exact precision (validated against the raw Bronze text) |
-# MAGIC | `unit`, `obs_status` | empty / whitespace-only become NULL (approved) | A blank string doesn't carry information |
-# MAGIC | `indicator_id`, `country_iso3_code`, `country_id` | trim + upper-case; empty becomes NULL | Stable join keys across loads. Any value actually changed is counted and reported |
-# MAGIC | `indicator_name`, `country_name` | trim only, case kept | Business text kept intact |
-# MAGIC | `source_last_updated_date` | from the World Bank metadata of the same file | Tells Gold which World Bank release a snapshot reflects |
-# MAGIC | `record_key` | SHA-256 of business key + `ingestion_date` | Deterministic key for the idempotent MERGE in a later step |
-# MAGIC | `record_hash` | SHA-256 of all business attributes | Change detection between snapshots |
-# MAGIC | `dq_flags` | `NULL_GDP_VALUE`, `NEGATIVE_GDP_VALUE`, `ZERO_GDP_VALUE`, `NON_ANNUAL_PERIOD`, `ISO3_FORMAT`, `SCHEMA_DRIFT` | Flagged, **not** removed or changed (no business rule invented) |
-# MAGIC
-# MAGIC **Unexpected nulls / schema variation**
-# MAGIC * A NULL `indicator_id`, `country_iso3_code`, `observation_period` or `ingestion_date` cannot form a key, so the record goes to `silver_gdp_rejects_df` with its reasons. It is never dropped.
-# MAGIC * A missing input column is added as typed NULL with a warning.
-# MAGIC * An input column whose type differs from the contract stops the pipeline, because silently casting it could lose data.
-# MAGIC
-# MAGIC **History**: no deduplication across loads. Every `ingestion_date` snapshot is kept.
-
-# COMMAND ----------
 
 # DBTITLE 1,6a - Silver contract and standardisation
 GDP_DECIMAL = VALUE_DECIMAL     # DECIMAL(38,10) - validated lossless in Steps 3-5
@@ -1384,32 +1276,6 @@ if failed6:
     raise PipelineError(f"Step 6 validation failed: {[c[0] for c in failed6]}")
 logger.info(f"Step 6 validation passed: {len(checks6)} checks, {sum(c[3] == 'WARN' for c in checks6)} warning(s)")
 
-# COMMAND ----------
-
-# DBTITLE 1,Step 8 header
-# MAGIC %md
-# MAGIC ## Step 8 - Silver Delta tables (DDL only, no data written)
-# MAGIC
-# MAGIC Approved design: Unity Catalog managed Delta tables in `dbt_global_economy.silver`, inheriting the schema's managed location.
-# MAGIC
-# MAGIC | Object | Purpose | Key | Clustering | Notes |
-# MAGIC | --- | --- | --- | --- | --- |
-# MAGIC | `wb_indicator_observations` | Trusted observations, all indicators, full snapshot history | `record_key` (PK) = SHA-256(indicator_id, country_iso3_code, observation_period, ingestion_date) | `indicator_id, country_iso3_code` | `delta.appendOnly = true` |
-# MAGIC | `v_gdp_observations` | GDP view (`NY.GDP.MKTP.CD`, `observation_value AS gdp_value`) | - | - | Gold-facing |
-# MAGIC | `wb_load_metadata` | Pagination, ingestion and reconciliation audit | `metadata_key` (PK) = SHA-256(source_file_path, page) | `indicator_code, country_iso3` | |
-# MAGIC | `wb_indicator_quarantine` | Invalid / conflicting records | `quarantine_key` (PK) | `quarantine_stage, ingestion_date` | |
-# MAGIC | `wb_pipeline_run_audit` | One row per run | `pipeline_run_id` (PK) | - | |
-# MAGIC
-# MAGIC * **Common properties:**
-# MAGIC   * Change Data Feed on;
-# MAGIC   * column mapping by name;
-# MAGIC   * 90-day log retention, 7-day deleted-file retention;
-# MAGIC   * predictive optimisation (inherited) runs OPTIMIZE and VACUUM;
-# MAGIC   * no partitioning, given the tiny data volume.
-# MAGIC * **Single source of truth:** table specs are defined once in Python and used both to generate the DDL and to validate the created tables.
-# MAGIC * **Safe to re-run:** `CREATE TABLE IF NOT EXISTS`. An existing table is never replaced or altered; it's only validated against the spec.
-
-# COMMAND ----------
 
 # DBTITLE 1,8a - Silver table specifications
 # (name, type, nullable, comment) - single source of truth for DDL and post-creation validation
@@ -1675,20 +1541,7 @@ if failed8:
     raise PipelineError(f"Step 8 validation failed: {[c[0] for c in failed8]}")
 logger.info(f"Step 8 validation passed: {len(checks8)} checks, {sum(c[3] == 'WARN' for c in checks8)} warning(s)")
 
-# COMMAND ----------
 
-# DBTITLE 1,Step 9 header
-# MAGIC %md
-# MAGIC ## Step 9 - Insert-only Silver load (approved)
-# MAGIC
-# MAGIC * **Gate:** nothing is written unless every file passed the Step 5 reconciliation (Steps 3-6 already stop the run on critical failures).
-# MAGIC * **Insert-only MERGE** on each table's key (`record_key`, `metadata_key`, `quarantine_key`, `pipeline_run_id`): new keys are inserted, existing keys are never updated or deleted. Reprocessing a snapshot inserts 0 rows. If the append-only observations table rejects MERGE, the write falls back to appending only keys not already present (same semantics).
-# MAGIC * **Snapshot conflict** (same `record_key`, different `record_hash`): the incoming rows are quarantined as `SNAPSHOT_CONFLICT`, the stored history is untouched, and the run fails (approved).
-# MAGIC * **Write order:** quarantine, then metadata, then observations, then run audit. The four writes are not one transaction: each is insert-only, so a rerun after a partial failure only fills in what is missing.
-# MAGIC * **Run audit:** every run, successful or failed, writes one `wb_pipeline_run_audit` row with counts and the error message.
-# MAGIC * **Scope guard:** Step 6 standardises GDP only. If a non-GDP indicator appears, the load stops rather than writing a partial picture, and Step 6 is extended first.
-
-# COMMAND ----------
 
 # DBTITLE 1,9a - Build source DataFrames for the four tables
 OBS_COLS = [c[0] for c in OBSERVATION_COLUMNS]
@@ -1931,7 +1784,7 @@ check9("failed runs in audit", 0, audit_t.filter(F.col("run_status") == "FAILED"
 check9("v_gdp_observations rows == GDP rows in table",
        obs_t.filter(F.col("indicator_id") == GDP_INDICATOR_ID).count(), gdp_v.count())
 
-# 5. Table history: only CREATE and inserts (no UPDATE / DELETE on history)
+# 5. Table history: only CREATE and inserts (no UPDATE / DELETE on history)a
 ops = {r.operation for r in spark.sql(f"DESCRIBE HISTORY {TABLES['observations']}").collect()}
 check9("observations history has no UPDATE/DELETE", set(), ops & {"UPDATE", "DELETE", "TRUNCATE", "CREATE OR REPLACE TABLE"})
 
