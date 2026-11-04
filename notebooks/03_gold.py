@@ -1,4 +1,4 @@
-
+# Databricks notebook source
 
 # DBTITLE 1,Create Gold schema and table
 import uuid
