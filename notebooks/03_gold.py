@@ -1,31 +1,4 @@
-# Databricks notebook source
-# DBTITLE 1,Title
-# MAGIC %md
-# MAGIC # World Bank Gold Layer - GDP by Country and Year
-# MAGIC
-# MAGIC Builds `dbt_global_economy.gold.gdp_country_year` from the Silver view `dbt_global_economy.silver.v_gdp_observations`.
-# MAGIC
-# MAGIC * **Grain:** one row per country and year.
-# MAGIC * **Snapshot rule (approved):** each row holds the value from the latest ADF load (`ingestion_date`). Silver keeps the full snapshot history.
-# MAGIC * **YoY (approved):** `gdp_yoy_change_pct` = (GDP - previous-year GDP) / previous-year GDP x 100. It is NULL when the previous year is missing, either value is NULL, or the previous value is 0. It is never filled with 0.
-# MAGIC * **Refresh:** a MERGE on (`country_iso3_code`, `year`) that is safe to rerun. A row only changes when its source snapshot, name or YoY changes.
-# MAGIC * **Annual only:** only annual periods (`year` not NULL) are in scope; non-annual Silver rows are counted and reported.
 
-# COMMAND ----------
-
-# DBTITLE 1,Gold table design
-# MAGIC %md
-# MAGIC ## Step 1 - Gold schema, table design and load strategy
-# MAGIC
-# MAGIC * **Source:** `dbt_global_economy.silver.v_gdp_observations`.
-# MAGIC * **Target:** `dbt_global_economy.gold.gdp_country_year`.
-# MAGIC * **Grain:** one row per `country_iso3_code, year`.
-# MAGIC * **Snapshot rule (approved):** for each country-year, keep the row from the latest `ingestion_date`.
-# MAGIC * **YoY (approved):** `gdp_yoy_change_pct = ((gdp_usd - previous_gdp_usd) / previous_gdp_usd) * 100`; it is NULL when the previous year is missing, either value is NULL, or the previous value is 0.
-# MAGIC * **Refresh:** idempotent MERGE on (`country_iso3_code`, `year`).
-# MAGIC * **History:** Silver retains all historical snapshots; Gold keeps the latest curated state per country-year.
-
-# COMMAND ----------
 
 # DBTITLE 1,Create Gold schema and table
 import uuid
